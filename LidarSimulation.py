@@ -4,18 +4,15 @@ import torch
 from typing import List, Tuple, Optional
 from Sensor import Sensor
 from Material import Material
-from RayIntersection import RayMeshIntersector
 
 class LiDARSimulator:
     def __init__(self, mesh: trimesh.Trimesh, sensors: List[Sensor], material: Optional[Material] = None):
-
         """        
         Args:
             mesh: Scene mesh to scan
             sensors: List of Sensor objects defining different scan positions
             material: Optional Material object defining surface properties
         """
-
         self.material = material or Material()
         # Center the mesh at origin
         self.original_centroid = mesh.centroid
@@ -35,6 +32,9 @@ class LiDARSimulator:
         
         self.sensors = sensors
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Batch size for ray processing to limit memory usage
+        self.batch_size = 50000
     
     def world_to_centered(self, points: np.ndarray) -> np.ndarray:
         """Convert world coordinates to centered mesh coordinates"""
@@ -56,7 +56,7 @@ class LiDARSimulator:
         theta = np.arccos(direction[2])                  # polar angle
         return phi, theta
         
-    def _compute_ray_directions(self, target_direction: np.ndarray, sensor: Sensor) -> torch.Tensor:
+    def _compute_ray_directions(self, target_direction: np.ndarray, sensor: Sensor) -> np.ndarray:
         """
         Compute ray directions for a specific sensor
         """
@@ -87,27 +87,27 @@ class LiDARSimulator:
                 directions[idx] = self._spherical_to_cartesian(phi, theta)
                 idx += 1
                 
-        return torch.tensor(directions, device=self.device, dtype=torch.float32)
+        return directions
     
-    def _compute_noise(self, distances: torch.Tensor, reflectivity: torch.Tensor) -> torch.Tensor:
+    def _compute_noise(self, distances: np.ndarray, reflectivity: np.ndarray) -> np.ndarray:
         """Compute noise based on distance and reflectivity"""
         # Simplified noise model
-        base_noise = torch.where(
+        base_noise = np.where(
             distances <= 5.0, 0.0005,
-            torch.where(distances <= 20.0, 0.0007,
-            torch.where(distances <= 40.0, 0.0025, 0.005)))
+            np.where(distances <= 20.0, 0.0007,
+            np.where(distances <= 40.0, 0.0025, 0.005)))
             
         # Scale noise based on reflectivity
-        noise_scale = torch.where(
+        noise_scale = np.where(
             reflectivity <= 0.08, 1.5,  # Black 8%
-            torch.where(reflectivity <= 0.21, 1.2,  # Gray 21%
+            np.where(reflectivity <= 0.21, 1.2,  # Gray 21%
             1.0))  # White 89%
             
-        return torch.randn_like(distances) * base_noise * noise_scale
+        return np.random.randn(len(distances)) * base_noise * noise_scale
         
     def simulate(self, add_noise: bool = True) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Perform LiDAR simulation from all sensor positions simultaneously
+        Perform LiDAR simulation from all sensor positions using memory-efficient batching
         
         Args:
             add_noise: Whether to add measurement noise
@@ -131,83 +131,87 @@ class LiDARSimulator:
             # Compute ray directions for this sensor
             ray_directions = self._compute_ray_directions(target_direction, sensor)
             
-            # Setup ray origins
-            origins = torch.tensor(centered_position, device=self.device, dtype=torch.float32)
-            origins = origins.expand(len(ray_directions), 3)
+            # Initialize arrays to store results
+            all_points = []
+            all_normals = []
+            all_reflectivity = []
             
-            # Perform ray-casting
-            intersector = RayMeshIntersector(self.mesh)
-            points, face_indices, ray_indices = intersector.compute_intersections(
-                origins, ray_directions,
-                min_distance=sensor.min_distance,
-                max_distance=sensor.max_distance
-            )
-
-            # Only access face_labels if there are any intersections
-            if len(face_indices) > 0:
-                try:
-                    object_labels = self.mesh.visual.face_labels[face_indices]
-                except (AttributeError, IndexError):
-                    # If face_labels access fails, create a default array
-                    object_labels = np.full(len(face_indices), "default_object")
+            # Process rays in batches to reduce memory usage
+            num_rays = len(ray_directions)
+            num_batches = int(np.ceil(num_rays / self.batch_size))
             
-            # Compute surface normals and reflectivity
-            normals = self._compute_normals(points)
-            reflectivity = self._compute_reflectivity(normals, ray_directions[ray_indices])
+            print(f"Processing {num_rays} rays in {num_batches} batches")
             
-            if add_noise:
-                distances = torch.norm(points - origins[ray_indices], dim=1)
-                noise = self._compute_noise(distances, reflectivity)
-                points += ray_directions[ray_indices] * noise.unsqueeze(1)
-            
-            # Convert points back to world coordinates
-            world_points = self.centered_to_world(points.cpu().numpy())
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min((batch_idx + 1) * self.batch_size, num_rays)
                 
-            results.append((
-                world_points,
-                normals.cpu().numpy(),
-                reflectivity.cpu().numpy()
-            ))
+                # Get ray directions for this batch
+                batch_directions = ray_directions[start_idx:end_idx]
+                
+                # Create ray origins for this batch
+                batch_origins = np.tile(centered_position, (len(batch_directions), 1))
+                
+                # Use trimesh's ray.intersects_location directly
+                locations, index_ray, index_tri = self.mesh.ray.intersects_location(
+                    ray_origins=batch_origins,
+                    ray_directions=batch_directions,
+                    multiple_hits=False
+                )
+                
+                if len(locations) > 0:
+                    # Get face normals for intersections
+                    batch_normals = self.mesh.face_normals[index_tri]
+                    
+                    # Compute reflectivity based on angle between ray and normal
+                    batch_ray_dirs = batch_directions[index_ray]
+                    dot_products = np.abs(np.sum(batch_normals * (-batch_ray_dirs), axis=1))
+                    batch_reflectivity = self.material.albedo * dot_products
+                    batch_reflectivity = np.clip(batch_reflectivity, 0.0, 1.0)
+                    
+                    # Apply noise if requested
+                    if add_noise:
+                        # Distance-based noise model
+                        distances = np.linalg.norm(locations - centered_position, axis=1)
+                        
+                        # Compute noise based on distance and reflectivity
+                        noise = self._compute_noise(distances, batch_reflectivity)
+                        
+                        # Apply noise in ray direction
+                        locations += batch_ray_dirs * noise.reshape(-1, 1)
+                        
+                        # Add noise to reflectivity
+                        batch_reflectivity += np.random.normal(0, 0.05, len(batch_reflectivity))
+                        batch_reflectivity = np.clip(batch_reflectivity, 0.0, 1.0)
+                    
+                    # Add results to the collection
+                    all_points.append(locations)
+                    all_normals.append(batch_normals)
+                    all_reflectivity.append(batch_reflectivity)
+            
+            # Combine results for this sensor
+            if all_points:
+                points = np.vstack(all_points)
+                normals = np.vstack(all_normals)
+                reflectivity = np.concatenate(all_reflectivity)
+                
+                # Convert points back to world coordinates
+                world_points = self.centered_to_world(points)
+                
+                results.append((
+                    world_points,
+                    normals,
+                    reflectivity
+                ))
+            else:
+                # Return empty arrays if no intersections found
+                results.append((
+                    np.zeros((0, 3)),
+                    np.zeros((0, 3)),
+                    np.zeros(0)
+                ))
             
         return results
-    
-    def _compute_normals(self, points: torch.Tensor) -> torch.Tensor:
-        intersector = RayMeshIntersector(self.mesh)
-        nearest_faces = self._find_nearest_faces(points)
-        return intersector.compute_normals(points, nearest_faces)
-    
-    def _find_nearest_faces(self, points: torch.Tensor) -> torch.Tensor:
-        """Find the nearest face indices for given points"""
-        points_np = points.cpu().numpy()
-        _, face_indices, _ = self.mesh.nearest.on_surface(points_np)
-        return torch.tensor(face_indices, device=self.device, dtype=torch.int64)
-    
-    def _compute_reflectivity(self, normals: torch.Tensor, ray_dirs: torch.Tensor) -> torch.Tensor:
-        """
-        Compute Lambertian reflectivity for each intersection point.
-        
-        Args:
-            normals: (N, 3) tensor of surface normals at intersection points
-            ray_dirs: (N, 3) tensor of ray directions
-            
-        Returns:
-            (N,) tensor of reflectivity values in range [0, 1]
-        """
-        # Normalize vectors
-        normals = normals / torch.norm(normals, dim=1, keepdim=True)
-        ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=1, keepdim=True)
-        
-        # Compute cosine of angle between normal and ray direction
-        # Use negative ray direction since we want angle with incoming ray
-        cos_theta = torch.abs(torch.sum(normals * (-ray_dirs), dim=1))
-        
-        # Apply Lambertian reflection model
-        # Scale to [0,1] range and apply material albedo
-        albedo = self.material.albedo[0]
-        reflectivity = albedo * cos_theta
-        
-        # Ensure reflectivity is in valid range
-        return torch.clamp(reflectivity, 0.0, 1.0)
     
     def visualize_results(self, results: List[Tuple[np.ndarray, np.ndarray, np.ndarray]], mesh_path: str):
         from VisualizeSimulation import LIDARVisualizer

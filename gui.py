@@ -8,10 +8,10 @@ from PyQt5.QtWidgets import (
     QTabWidget, QScrollArea, QGridLayout, QDialog, QComboBox,
     QListWidget, QListWidgetItem, QMessageBox, QStackedWidget,
     QGroupBox, QCheckBox, QSlider, QColorDialog, QLineEdit,
-    QSplitter, QSizePolicy
+    QSplitter, QSizePolicy, QProgressDialog
 )
 from PyQt5.QtGui import QPixmap, QImage, QColor
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PIL import Image, ImageDraw
 import io
 import trimesh
@@ -22,8 +22,7 @@ from OpticalSimulation import OpticalSimulator
 from Sensor import Sensor
 from LidarSimulation import LiDARSimulator
 from Material import Material
-from VisualizeSimulation import LIDARVisualizer
-from SceneGenerator import SceneGenerator, SceneObject
+from SceneGenerator import SceneGenerator
 
 # A helper function to convert a PIL image to QPixmap
 def pil_to_qpixmap(pil_image):
@@ -95,6 +94,145 @@ def convert_scene_objects_to_material_dict(scene_objects):
         if obj.material is not None:
             material_dict[name] = obj.material
     return material_dict
+
+class LidarScanThread(QThread):
+    """Thread for running LiDAR scan in the background"""
+    # Define signals for communication with main thread
+    finished = pyqtSignal(list)  # Signal emitted when scan completes, passes results
+    progress = pyqtSignal(int)   # Signal for progress updates (0-100)
+    error = pyqtSignal(str)      # Signal for error messages
+    
+    def __init__(self, lidar_simulator, add_noise):
+        super().__init__()
+        self.lidar_simulator = lidar_simulator
+        self.add_noise = add_noise
+        
+    def run(self):
+        """Run the LiDAR scanning process"""
+        try:
+            # Get total number of rays that will be processed
+            total_rays = 0
+            for sensor in self.lidar_simulator.sensors:
+                # Calculate ray count based on FOV and step angle
+                h_rays = int(sensor.horizontal_fov / sensor.step_angle)
+                v_rays = int(sensor.vertical_fov / sensor.step_angle)
+                total_rays += h_rays * v_rays
+            
+            # Create a modified simulate method that reports progress
+            def simulate_with_progress():
+                results = []
+                rays_processed = 0
+                
+                # Process each sensor
+                for sensor_idx, sensor in enumerate(self.lidar_simulator.sensors):
+                    # Get sensor position and direction
+                    position, target_direction = sensor.get_sensor_transform()
+                    
+                    # Convert position to centered coordinate system
+                    centered_position = self.lidar_simulator.world_to_centered(position)
+                    
+                    # Normalize target direction
+                    target_direction = target_direction / np.linalg.norm(target_direction)
+                    
+                    # Compute ray directions for this sensor
+                    ray_directions = self.lidar_simulator._compute_ray_directions(target_direction, sensor)
+                    
+                    # Initialize arrays to store results
+                    all_points = []
+                    all_normals = []
+                    all_reflectivity = []
+                    
+                    # Process rays in batches to reduce memory usage
+                    num_rays = len(ray_directions)
+                    num_batches = int(np.ceil(num_rays / self.lidar_simulator.batch_size))
+                    
+                    for batch_idx in range(num_batches):
+                        start_idx = batch_idx * self.lidar_simulator.batch_size
+                        end_idx = min((batch_idx + 1) * self.lidar_simulator.batch_size, num_rays)
+                        
+                        # Get ray directions for this batch
+                        batch_directions = ray_directions[start_idx:end_idx]
+                        
+                        # Create ray origins for this batch
+                        batch_origins = np.tile(centered_position, (len(batch_directions), 1))
+                        
+                        # Use trimesh's ray.intersects_location directly
+                        locations, index_ray, index_tri = self.lidar_simulator.mesh.ray.intersects_location(
+                            ray_origins=batch_origins,
+                            ray_directions=batch_directions,
+                            multiple_hits=False
+                        )
+                        
+                        if len(locations) > 0:
+                            # Get face normals for intersections
+                            batch_normals = self.lidar_simulator.mesh.face_normals[index_tri]
+                            
+                            # Compute reflectivity based on angle between ray and normal
+                            batch_ray_dirs = batch_directions[index_ray]
+                            dot_products = np.abs(np.sum(batch_normals * (-batch_ray_dirs), axis=1))
+                            batch_reflectivity = self.lidar_simulator.material.albedo * dot_products
+                            batch_reflectivity = np.clip(batch_reflectivity, 0.0, 1.0)
+                            
+                            # Apply noise if requested
+                            if self.add_noise:
+                                # Distance-based noise model
+                                distances = np.linalg.norm(locations - centered_position, axis=1)
+                                
+                                # Compute noise based on distance and reflectivity
+                                noise = self.lidar_simulator._compute_noise(distances, batch_reflectivity)
+                                
+                                # Apply noise in ray direction
+                                locations += batch_ray_dirs * noise.reshape(-1, 1)
+                                
+                                # Add noise to reflectivity
+                                batch_reflectivity += np.random.normal(0, 0.05, len(batch_reflectivity))
+                                batch_reflectivity = np.clip(batch_reflectivity, 0.0, 1.0)
+                            
+                            # Add results to the collection
+                            all_points.append(locations)
+                            all_normals.append(batch_normals)
+                            all_reflectivity.append(batch_reflectivity)
+                        
+                        # Update progress
+                        rays_processed += len(batch_directions)
+                        progress_percent = int(rays_processed / total_rays * 100)
+                        self.progress.emit(progress_percent)
+                        
+                        # Small sleep to allow GUI to update
+                        self.msleep(1)
+                    
+                    # Combine results for this sensor
+                    if all_points:
+                        points = np.vstack(all_points)
+                        normals = np.vstack(all_normals)
+                        reflectivity = np.concatenate(all_reflectivity)
+                        
+                        # Convert points back to world coordinates
+                        world_points = self.lidar_simulator.centered_to_world(points)
+                        
+                        results.append((
+                            world_points,
+                            normals,
+                            reflectivity
+                        ))
+                    else:
+                        # Return empty arrays if no intersections found
+                        results.append((
+                            np.zeros((0, 3)),
+                            np.zeros((0, 3)),
+                            np.zeros(0)
+                        ))
+                
+                return results
+            
+            # Run the simulation with progress tracking
+            results = simulate_with_progress()
+            self.finished.emit(results)
+            
+        except Exception as e:
+            import traceback
+            self.error.emit(f"Error in LiDAR scan: {str(e)}\n{traceback.format_exc()}")
+
 
 class SceneGeneratorDialog(QDialog):
     """Dialog for creating and editing scenes with multiple objects"""
@@ -426,8 +564,9 @@ class SceneGeneratorDialog(QDialog):
             name = name_edit.text()
             
             # Create material
-            albedo = np.array(color_value) / 255.0
-            material = Material(albedo=albedo)
+            # Convert RGB to grayscale using standard luminance formula
+            grayscale = (0.299 * color_value[0] + 0.587 * color_value[1] + 0.114 * color_value[2]) / 255.0
+            material = Material(albedo=grayscale)
             
             try:
                 # Add the object to the scene
@@ -529,8 +668,10 @@ class SceneGeneratorDialog(QDialog):
         if obj.material:
             dialog_layout.addWidget(QLabel("Material Albedo (RGB):"))
             color_btn = QPushButton("Choose Color")
-            # Convert [0-1] range to [0-255]
-            color_value = [int(c * 255) for c in obj.material.albedo]
+            
+            # For display purposes, convert the single albedo value to grayscale RGB
+            gray_value = int(obj.material.albedo * 255)
+            color_value = [gray_value, gray_value, gray_value]
             
             def choose_color():
                 nonlocal color_value
@@ -585,7 +726,7 @@ class SceneGeneratorDialog(QDialog):
                     # If there's a collision, put it back in its original position
                     self.scene_generator.objects[name] = temp_obj
                     QMessageBox.warning(self, "Position Conflict", 
-                                      f"Couldn't move object: {str(e)}\nObject kept at original position.")
+                                    f"Couldn't move object: {str(e)}\nObject kept at original position.")
                     self.update_scene_preview()
                     return
             else:
@@ -612,7 +753,9 @@ class SceneGeneratorDialog(QDialog):
             
             # Update material if available
             if obj.material and 'color_value' in locals():
-                obj.material.albedo = np.array(color_value) / 255.0
+                # Convert RGB to grayscale using standard luminance formula
+                grayscale = (0.299 * color_value[0] + 0.587 * color_value[1] + 0.114 * color_value[2]) / 255.0
+                obj.material.albedo = grayscale
             
             # Update the view
             self.update_scene_preview()
@@ -979,13 +1122,16 @@ class MaterialDialog(QDialog):
         layout = QVBoxLayout()
         self.setLayout(layout)
         
-        # Albedo color
+        # Albedo slider (changed from color picker to slider)
         albedo_layout = QHBoxLayout()
         albedo_layout.addWidget(QLabel("Albedo:"))
-        self.albedo_btn = QPushButton()
-        self.update_color_button(self.albedo_btn, self.material.albedo)
-        self.albedo_btn.clicked.connect(self.choose_albedo_color)
-        albedo_layout.addWidget(self.albedo_btn)
+        self.albedo_slider = QSlider(Qt.Horizontal)
+        self.albedo_slider.setRange(0, 100)
+        self.albedo_slider.setValue(int(self.material.albedo * 100))
+        albedo_layout.addWidget(self.albedo_slider)
+        self.albedo_label = QLabel(f"{self.material.albedo:.2f}")
+        albedo_layout.addWidget(self.albedo_label)
+        self.albedo_slider.valueChanged.connect(self.update_albedo_label)
         layout.addLayout(albedo_layout)
         
         # Metallic slider
@@ -1034,21 +1180,9 @@ class MaterialDialog(QDialog):
         button_layout.addWidget(cancel_btn)
         layout.addLayout(button_layout)
     
-    def update_color_button(self, button, color_array):
-        color = QColor(int(color_array[0] * 255), int(color_array[1] * 255), int(color_array[2] * 255))
-        button.setStyleSheet(f"background-color: {color.name()}; min-height: 30px;")
-        button.setText(f"RGB: {color.red()}, {color.green()}, {color.blue()}")
-    
-    def choose_albedo_color(self):
-        current_color = QColor(
-            int(self.material.albedo[0] * 255),
-            int(self.material.albedo[1] * 255),
-            int(self.material.albedo[2] * 255)
-        )
-        color = QColorDialog.getColor(current_color, self, "Choose Albedo Color")
-        if color.isValid():
-            self.material.albedo = np.array([color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0])
-            self.update_color_button(self.albedo_btn, self.material.albedo)
+    def update_albedo_label(self, value):
+        albedo = value / 100.0
+        self.albedo_label.setText(f"{albedo:.2f}")
     
     def update_metallic_label(self, value):
         metallic = value / 100.0
@@ -1064,7 +1198,7 @@ class MaterialDialog(QDialog):
     
     def get_material(self):
         return Material(
-            albedo=self.material.albedo,
+            albedo=self.albedo_slider.value() / 100.0,
             metallic=self.metallic_slider.value() / 100.0,
             roughness=self.roughness_slider.value() / 100.0,
             ambient=self.ambient_slider.value() / 100.0
@@ -1422,9 +1556,11 @@ class MainWindow(QMainWindow):
                             if np.any(mask):
                                 # Get the first face color for this label
                                 face_color = self.mesh.visual.face_colors[mask][0]
-                                # Create a material with albedo from this color
+                                # Create a material with albedo from this color - convert RGB to grayscale
+                                rgb = face_color[:3]
+                                grayscale = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255.0
                                 mat = Material(
-                                    albedo=np.array(face_color[:3], dtype=float) / 255.0,
+                                    albedo=grayscale,
                                     metallic=self.lidar_material.metallic,
                                     roughness=self.lidar_material.roughness,
                                     ambient=self.lidar_material.ambient
@@ -1433,7 +1569,7 @@ class MainWindow(QMainWindow):
                         else:
                             # If no face colors, use default material with varied albedo
                             color_val = hash(str(label)) % 200 + 55  # Range 55-255
-                            albedo = np.array([color_val, color_val, color_val], dtype=float) / 255.0
+                            albedo = color_val / 255.0  # Single grayscale value
                             mat = Material(
                                 albedo=albedo,
                                 metallic=self.lidar_material.metallic,
@@ -1670,51 +1806,77 @@ class MainWindow(QMainWindow):
         self.edit_sensor_btn.setEnabled(True)
         self.remove_sensor_btn.setEnabled(True)
         self.update_3d_preview()
+
+    def handle_scan_finished(self, results):
+        # Store the results
+        self.lidar_results = results
+        
+        # Re-enable controls
+        self.run_lidar_btn.setEnabled(True)
+        self.export_lidar_btn.setEnabled(True)
+        
+        # Show success message
+        QMessageBox.information(self, "LiDAR Scan", "LiDAR scan completed successfully.")
+        
+        # Update the visualization
+        self.visualize_lidar_results()
+        
+        # Switch to the LiDAR Results tab
+        self.tabs.setCurrentWidget(self.lidar_tab)
+
+    def handle_scan_error(self, error_message):
+        # Re-enable controls
+        self.run_lidar_btn.setEnabled(True)
+        
+        # Show error message
+        QMessageBox.critical(self, "LiDAR Scan Error", error_message)
     
     def run_lidar_scan(self):
-        """Run LiDAR scan with all configured sensors"""
         if self.mesh is None:
-            QMessageBox.warning(self, "No Model", "Please load a CAD model first.")
+            QMessageBox.warning(self, "No CAD Model", "Please load a CAD model first.")
             return
-            
+        
         if not self.sensors:
             QMessageBox.warning(self, "No Sensors", "Please add at least one sensor first.")
             return
-            
-        # Create a new LiDAR simulator with current mesh, sensors, and material
-        self.lidar_simulator = self.create_lidar_simulator()
-        if self.lidar_simulator is None:
-            return
-            
+
         try:
-            print("Starting LiDAR simulation...")
-            # Run simulation with current noise setting
-            add_noise = self.add_noise_checkbox.isChecked()
-            self.lidar_results = self.lidar_simulator.simulate(add_noise=add_noise)
+            # Instantiate the simulator
+            self.lidar_simulator = self.create_lidar_simulator()
+            if not self.lidar_simulator:
+                return
             
-            # Clear the current visualization before adding new elements
-            self.lidar_vtk_widget.clear()
+            # Create the progress dialog
+            self.progress_dialog = QProgressDialog("Running LiDAR scan...", "Cancel", 0, 100, self)
+            self.progress_dialog.setWindowModality(Qt.WindowModal)
+            self.progress_dialog.setWindowTitle("LiDAR Scan Progress")
+            self.progress_dialog.setMinimumDuration(0)  # Show immediately
+            self.progress_dialog.setValue(0)
+            self.progress_dialog.setAutoClose(True)
+            self.progress_dialog.setAutoReset(True)
             
-            # Visualize results
-            self.visualize_lidar_results()
+            # Create and configure the worker thread
+            self.scan_thread = LidarScanThread(
+                lidar_simulator=self.lidar_simulator,
+                add_noise=self.add_noise_checkbox.isChecked()
+            )
             
-            # Enable export button
-            self.export_lidar_btn.setEnabled(True)
+            # Connect signals
+            self.scan_thread.progress.connect(self.progress_dialog.setValue)
+            self.scan_thread.finished.connect(self.handle_scan_finished)
+            self.scan_thread.error.connect(self.handle_scan_error)
+            self.progress_dialog.canceled.connect(self.scan_thread.terminate)
             
-            # Switch to LiDAR tab
-            self.tabs.setCurrentWidget(self.lidar_tab)
+            # Disable controls during scan
+            self.run_lidar_btn.setEnabled(False)
+            self.export_lidar_btn.setEnabled(False)
+            
+            # Start the thread
+            self.scan_thread.start()
             
         except Exception as e:
-            import traceback
-            error_traceback = traceback.format_exc()
-            QMessageBox.critical(self, "Simulation Error", 
-                            f"Error in LiDAR simulation: {str(e)}\n\nSee console for details.")
-            print("LiDAR simulation error details:")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Error message: {str(e)}")
-            print("Full traceback:")
-            print(error_traceback)
-            
+            QMessageBox.critical(self, "LiDAR Scan Error", f"Error starting LiDAR scan: {str(e)}")
+                
     def visualize_lidar_results(self):
         """Visualize LiDAR simulation results in the LiDAR tab"""
         if self.lidar_results is None:

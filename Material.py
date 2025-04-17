@@ -2,11 +2,11 @@ import numpy as np
 
 class Material:
     def __init__(self, 
-                 albedo: np.ndarray = np.array([0.8, 0.8, 0.8]),
+                 albedo: float = 0.7,
                  metallic: float = 0.0,
                  roughness: float = 0.5,
                  ambient: float = 0.2):
-        self.albedo = albedo.astype('f4')
+        self.albedo = float(albedo)
         self.metallic = float(metallic)
         self.roughness = float(roughness)
         self.ambient = float(ambient)
