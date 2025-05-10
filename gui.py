@@ -2057,7 +2057,7 @@ class MainWindow(QMainWindow):
                 bounding_box = self.mesh.bounds
                 diagonal = np.linalg.norm(bounding_box[1] - bounding_box[0])
                 marker_radius = diagonal * 0.015 * 0.8
-                arrow_length = diagonal * 0.015 * 3.5
+                arrow_length = diagonal * 0.015 * 1.5
                 
                 # Convert trimesh mesh to PyVista PolyData
                 vertices = self.mesh.vertices

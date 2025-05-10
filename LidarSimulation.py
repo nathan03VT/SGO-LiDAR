@@ -140,7 +140,7 @@ class LiDARSimulator:
             num_rays = len(ray_directions)
             num_batches = int(np.ceil(num_rays / self.batch_size))
             
-            print(f"Processing {num_rays} rays in {num_batches} batches")
+            # print(f"Processing {num_rays} rays in {num_batches} batches")
             
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * self.batch_size
